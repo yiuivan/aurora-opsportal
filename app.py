@@ -2,7 +2,8 @@
 Aurora Air HK Operations Control Panel
 Includes:
 - Multi-Wave Network Flow & Multi-Swap Fleet Optimizer
-- Dedicated 7-Row AirlineSim Flight Plan View (per-aircraft, Monday to Sunday grid)
+- Dedicated 7-Row AirlineSim Flight Plan View (Monday at top -> Sunday at bottom)
+- Fleet-Wide Overview Chart (Top-to-bottom airframe ordering)
 - AirlineSim Schedule Entry Assistant Table
 - Integrated Route Slot Opportunity Finder
 """
@@ -934,7 +935,7 @@ else:
 
     if as_slices:
         df_as = pd.DataFrame(as_slices)
-        # 7-row day timeline
+        # 7-row day timeline: Monday at the top, Sunday at the bottom
         fig_as = px.timeline(
             df_as,
             x_start="Start",
@@ -943,7 +944,7 @@ else:
             color="Type",
             text="Task",
             color_discrete_map={"Flight": "#1f77b4", "Maintenance": "#2ca02c"},
-            category_orders={"Day": list(reversed(DAY_NAMES_FULL))},
+            category_orders={"Day": DAY_NAMES_FULL},
         )
         fig_as.update_layout(
             xaxis_title="Time of Day (00:00 -> 24:00)",
@@ -1006,6 +1007,7 @@ else:
     with st.expander("🌐 View Entire Fleet Weekly Overview (All Aircraft)"):
         if gantt_records:
             df_gantt = pd.DataFrame(gantt_records)
+            # Fleet timeline: First aircraft at the top, last at the bottom
             fig = px.timeline(
                 df_gantt,
                 x_start="Start",
@@ -1016,7 +1018,6 @@ else:
                 color_discrete_map={"Flight": "#1f77b4", "Maintenance": "#2ca02c"},
                 category_orders={"Aircraft": [p.aircraft_id for p in fleet]},
             )
-            fig.update_yaxes(autorange="reversed")
             fig.update_layout(
                 xaxis_title="Weekly Timeline (Mon 00:00 -> Sun 24:00)",
                 height=450,
