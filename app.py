@@ -1,7 +1,10 @@
 """
 Aurora Air HK Operations Control Panel
-Multi-Wave Network Flow & Multi-Swap Fleet Optimizer
-Updated: Supports 'arrival_time' in flights CSV (with automatic midnight wrap calculation).
+Includes:
+- Multi-Wave Network Flow & Multi-Swap Fleet Optimizer
+- Dedicated 7-Row AirlineSim Flight Plan View (per-aircraft, Monday to Sunday grid)
+- AirlineSim Schedule Entry Assistant Table
+- Integrated Route Slot Opportunity Finder
 """
 
 import csv
@@ -20,6 +23,15 @@ import streamlit as st
 # --- CONSTANTS ---
 MINUTES_PER_WEEK = 7 * 24 * 60  # 10,080 minutes
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAY_NAMES_FULL = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
 DAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 # --- PAGE CONFIG ---
@@ -53,7 +65,7 @@ with col_logo:
 with col_title:
     st.title("Aurora Air HK Operations Control Panel")
     st.caption(
-        "Multi-Wave Network Flow Optimizer, Maintenance Compliance & Route Slot Discovery"
+        "AirlineSim Timetable Optimizer, 7-Day Aircraft Flight Plan Grid & Route Slot Discovery"
     )
 
 st.markdown("---")
@@ -94,12 +106,25 @@ def fmt_time(m: int) -> str:
     return f"{DAYS[d]} {rem // 60:02d}:{rem % 60:02d}"
 
 
+def fmt_clock(m: int) -> str:
+    m %= 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
 def minutes_to_iso_date(minute: int) -> str:
     minute %= MINUTES_PER_WEEK
     d_idx, rem = divmod(minute, 1440)
     hh, mm = divmod(rem, 60)
     day_num = 5 + d_idx  # Anchor calendar week Mon 2026-01-05 to Sun 2026-01-11
     return f"2026-01-{day_num:02d} {hh:02d}:{mm:02d}:00"
+
+
+def clock_min_to_iso(clock_min: int) -> str:
+    clock_min = min(1440, max(0, clock_min))
+    hh, mm = divmod(clock_min, 60)
+    if hh >= 24:
+        return "2026-01-01 23:59:59"
+    return f"2026-01-01 {hh:02d}:{mm:02d}:00"
 
 
 def extract_flight_num(fid: str) -> Tuple[str, Optional[int]]:
@@ -161,10 +186,6 @@ def parse_fleet(csv_content: str, default_hub: str = "HKG") -> List[Aircraft]:
 
 
 def parse_flights(csv_content: str) -> List[FlightLeg]:
-    """
-    Parses flights CSV.
-    Supports either 'arrival_time' (e.g. 12:10) or 'flight_duration_min' / 'flight_duration'.
-    """
     reader = csv.DictReader(io.StringIO(csv_content))
     legs = []
     for r in reader:
@@ -174,17 +195,15 @@ def parse_flights(csv_content: str) -> List[FlightLeg]:
             if not raw_t or raw_t == "ANY"
             else {x.strip() for x in raw_t.replace("/", ",").split(",") if x.strip()}
         )
-        
+
         dep_str = r["departure_time"].strip()
         turn = int(r.get("min_turnaround_min", r.get("turnaround_min", 80)))
         base_id = r["flight_id"].strip()
 
-        # Check whether arrival_time or flight_duration is provided
         if "arrival_time" in r and r["arrival_time"].strip():
             arr_str = r["arrival_time"].strip()
             dep_min_clock = parse_clock_minutes(dep_str)
             arr_min_clock = parse_clock_minutes(arr_str)
-            # Duration handles overnight wrap within the day (e.g., dep 23:20, arr 01:45 -> 145 min)
             dur = (arr_min_clock - dep_min_clock) % 1440
             if dur == 0:
                 dur = 1440
@@ -193,7 +212,9 @@ def parse_flights(csv_content: str) -> List[FlightLeg]:
         elif "flight_duration" in r and r["flight_duration"].strip():
             dur = int(r["flight_duration"])
         else:
-            raise ValueError(f"Row for flight {base_id} must have either 'arrival_time' or 'flight_duration_min'.")
+            raise ValueError(
+                f"Row for flight {base_id} must have either 'arrival_time' or 'flight_duration_min'."
+            )
 
         for d in parse_days(r["days_of_week"]):
             dep = parse_time(d, dep_str)
@@ -216,16 +237,12 @@ def parse_flights(csv_content: str) -> List[FlightLeg]:
 def build_pairings(
     legs: List[FlightLeg], hub: str
 ) -> Tuple[List[RotationPairing], List[Tuple[FlightLeg, str]]]:
-    """
-    Smart Route-Aware Pairing Builder:
-    Matches consecutive flight numbers (FA610 -> FA611) with priority to eliminate 24h layovers.
-    """
     outbounds = sorted([l for l in legs if l.origin == hub], key=lambda x: x.dep_time)
     inbounds = [l for l in legs if l.destination == hub]
     used_inbounds, used_outbounds = set(), set()
     pairings = []
 
-    # Pass 1: Match consecutive flight numbers (FA610 with FA611) with ground time >= 45m
+    # Consecutive flight numbers matching (FA610 -> FA611)
     for out_l in outbounds:
         pfx_out, num_out = extract_flight_num(out_l.base_id)
         if num_out is None:
@@ -255,7 +272,7 @@ def build_pairings(
                 )
             )
 
-    # Pass 2: Fallback for any remaining outbounds
+    # General turnaround fallback matching
     for out_l in outbounds:
         if out_l.flight_id in used_outbounds:
             continue
@@ -372,7 +389,9 @@ def validate_maintenance_compliance(
 ) -> bool:
     if not pairs:
         return True
-    blocks = get_maint_blocks(plane, pairs, min_session_credit, allow_outstation, hub_code)
+    blocks = get_maint_blocks(
+        plane, pairs, min_session_credit, allow_outstation, hub_code
+    )
     if not blocks:
         return False
 
@@ -547,6 +566,46 @@ def solve_schedule_global(
     return best_sched, best_unassigned
 
 
+# --- SLICING HELPER FOR THE 7-ROW AIRLINESIM GRID ---
+def slice_interval_into_days(
+    start_m: int, end_m: int, label: str, b_type: str
+) -> List[dict]:
+    """Slices a start->end interval within the 10080-minute week into individual 0..1440 day segments."""
+    start_m %= MINUTES_PER_WEEK
+    dur = (end_m - start_m) % MINUTES_PER_WEEK
+    if dur == 0 and end_m != start_m:
+        dur = MINUTES_PER_WEEK
+
+    slices = []
+    curr_s = start_m
+    rem_dur = dur
+
+    while rem_dur > 0:
+        day_idx = (curr_s // 1440) % 7
+        day_start = (curr_s // 1440) * 1440
+        day_end = day_start + 1440
+
+        chunk = min(rem_dur, day_end - curr_s)
+        chunk_s = curr_s % 1440
+        chunk_e = chunk_s + chunk
+
+        slices.append(
+            {
+                "Day": DAY_NAMES_FULL[day_idx],
+                "Day_Idx": day_idx,
+                "Start": clock_min_to_iso(chunk_s),
+                "End": clock_min_to_iso(chunk_e),
+                "Task": label,
+                "Type": b_type,
+            }
+        )
+
+        curr_s = (curr_s + chunk) % MINUTES_PER_WEEK
+        rem_dur -= chunk
+
+    return slices
+
+
 # --- SIDEBAR: CONTROLS & POLICIES ---
 with st.sidebar:
     st.header("⚙️ Policy & Constraints")
@@ -660,7 +719,7 @@ else:
                             idle_list.append((avail_s, avail_e, dur))
             idle_windows_by_plane[plane.aircraft_id] = idle_list
 
-            # Flight bars
+            # Flight bars (fleet-wide Gantt)
             for p in pairs:
                 for l in (p.outbound, p.inbound):
                     sched_rows.append(
@@ -709,7 +768,7 @@ else:
                             }
                         )
 
-            # Maintenance bars
+            # Maintenance bars (fleet-wide Gantt)
             m_blocks = get_maint_blocks(
                 plane, pairs, min_session_credit, allow_outstation_maint, hub_airport
             )
@@ -824,32 +883,151 @@ else:
         delta_color="inverse",
     )
 
-    # --- GANTT TIMETABLE ---
-    st.subheader("2. Operational Fleet Gantt Timetable")
-    if gantt_records:
-        df_gantt = pd.DataFrame(gantt_records)
-        fig = px.timeline(
-            df_gantt,
+    # --- 2. AIRLINESIM BY-AIRCRAFT 7-ROW FLIGHT PLAN VIEW ---
+    st.subheader("2. 🛫 AirlineSim Flight Plan View (By Aircraft)")
+    st.caption(
+        "A 7-row day-by-day (Monday → Sunday) view matching the AirlineSim Flight Plan interface."
+    )
+
+    col_sel_ac, _ = st.columns([2, 3])
+    with col_sel_ac:
+        selected_ac_id = st.selectbox(
+            "Select Aircraft to View / Schedule:",
+            options=[p.aircraft_id for p in fleet],
+            format_func=lambda x: f"{x} ({next(p.aircraft_type_code for p in fleet if p.aircraft_id == x)})",
+        )
+
+    # Prepare daily slices for the selected aircraft
+    selected_plane = next(p for p in fleet if p.aircraft_id == selected_ac_id)
+    selected_pairs = sorted(sched[selected_ac_id], key=lambda x: x.dep_hub)
+
+    as_slices = []
+    # 1. Flights
+    for p in selected_pairs:
+        for l in (p.outbound, p.inbound):
+            as_slices.extend(
+                slice_interval_into_days(
+                    l.dep_time,
+                    l.arr_time,
+                    f"{l.flight_id.split('_')[0]} ({l.origin}-{l.destination})",
+                    "Flight",
+                )
+            )
+
+    # 2. Maintenance blocks
+    selected_m_blocks = get_maint_blocks(
+        selected_plane,
+        selected_pairs,
+        min_session_credit,
+        allow_outstation_maint,
+        hub_airport,
+    )
+    for s_m, e_m, g_m, c_m, loc in selected_m_blocks:
+        as_slices.extend(
+            slice_interval_into_days(
+                s_m,
+                s_m + g_m,
+                f"Maint {loc} ({c_m // 60}h{c_m % 60:02d}m)",
+                "Maintenance",
+            )
+        )
+
+    if as_slices:
+        df_as = pd.DataFrame(as_slices)
+        # 7-row day timeline
+        fig_as = px.timeline(
+            df_as,
             x_start="Start",
             x_end="End",
-            y="Aircraft",
+            y="Day",
             color="Type",
             text="Task",
             color_discrete_map={"Flight": "#1f77b4", "Maintenance": "#2ca02c"},
-            category_orders={"Aircraft": [p.aircraft_id for p in fleet]},
+            category_orders={"Day": list(reversed(DAY_NAMES_FULL))},
         )
-        fig.update_yaxes(autorange="reversed")
-        fig.update_layout(
-            xaxis_title="Weekly Timeline (Mon 00:00 -> Sun 24:00)",
-            height=540,
+        fig_as.update_layout(
+            xaxis_title="Time of Day (00:00 -> 24:00)",
+            yaxis_title=None,
+            height=380,
             xaxis=dict(
-                tickformat="%a %H:%M",
-                dtick=86400000 / 2,  # 12-hour tick marks
+                tickformat="%H:%M",
+                dtick=3600000 * 2,  # 2-hour tick marks (00:00, 02:00, 04:00...)
+                range=["2026-01-01 00:00:00", "2026-01-01 23:59:59"],
             ),
+            margin=dict(l=10, r=10, t=10, b=30),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig_as, use_container_width=True)
 
-    # --- TABS FOR TABLES, DOWNLOADS & SLOT FINDER ---
+    # Daily Entry Assistant (AirlineSim Order Format)
+    st.markdown(f"#### 📝 Schedule Entry Breakdown: **{selected_ac_id}**")
+
+    # Group all actions on this aircraft day-by-day
+    day_actions: Dict[int, List[dict]] = {d: [] for d in range(7)}
+    for p in selected_pairs:
+        for l in (p.outbound, p.inbound):
+            d_idx = (l.dep_time // 1440) % 7
+            day_actions[d_idx].append(
+                {
+                    "time_key": l.dep_time % 1440,
+                    "text": f"✈️ **{l.flight_id.split('_')[0]}** {l.origin} {fmt_clock(l.dep_time)} ➔ {l.destination} {fmt_clock(l.arr_time)}",
+                }
+            )
+    for s_m, e_m, g_m, c_m, loc in selected_m_blocks:
+        d_idx = (s_m // 1440) % 7
+        day_actions[d_idx].append(
+            {
+                "time_key": s_m % 1440,
+                "text": f"🛠️ **Maint {loc}** {fmt_clock(s_m)} ➔ {fmt_clock(s_m + g_m)} ({c_m // 60}h{c_m % 60:02d}m)",
+            }
+        )
+
+    as_table_rows = []
+    for d_idx in range(7):
+        actions = sorted(day_actions[d_idx], key=lambda x: x["time_key"])
+        action_strs = [a["text"] for a in actions]
+        as_table_rows.append(
+            {
+                "Day": DAY_NAMES_FULL[d_idx],
+                "Activities / Flight Sequence (In Order of Departure)": (
+                    " &nbsp;&nbsp; | &nbsp;&nbsp; ".join(action_strs)
+                    if action_strs
+                    else "*(Idle on Ground)*"
+                ),
+                "Total Flights": sum(1 for a in actions if a["text"].startswith("✈️")),
+            }
+        )
+
+    df_as_table = pd.DataFrame(as_table_rows)
+    st.dataframe(df_as_table, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # --- 3. FLEET-WIDE WEEKLY OVERVIEW ---
+    with st.expander("🌐 View Entire Fleet Weekly Overview (All Aircraft)"):
+        if gantt_records:
+            df_gantt = pd.DataFrame(gantt_records)
+            fig = px.timeline(
+                df_gantt,
+                x_start="Start",
+                x_end="End",
+                y="Aircraft",
+                color="Type",
+                text="Task",
+                color_discrete_map={"Flight": "#1f77b4", "Maintenance": "#2ca02c"},
+                category_orders={"Aircraft": [p.aircraft_id for p in fleet]},
+            )
+            fig.update_yaxes(autorange="reversed")
+            fig.update_layout(
+                xaxis_title="Weekly Timeline (Mon 00:00 -> Sun 24:00)",
+                height=450,
+                xaxis=dict(
+                    tickformat="%a %H:%M",
+                    dtick=86400000 / 2,
+                ),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    # --- 4. TABS FOR TABLES, DOWNLOADS & SLOT FINDER ---
     st.subheader("3. Fleet Performance & Route Opportunities")
     tab1, tab2, tab3, tab4 = st.tabs(
         [
